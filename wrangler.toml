@@ -2,6 +2,15 @@ name = "online-mirror"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+[[routes]]
+pattern = "online.a-i.indevs.in"
+custom_domain = true
+
 [[r2_buckets]]
 binding = "PHOTO_BUCKET"
 bucket_name = "photos"
+
+
+[assets]
+directory = "."
+binding = "ASSETS"

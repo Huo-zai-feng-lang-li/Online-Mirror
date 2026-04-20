@@ -1,8 +1,0 @@
-# Cloudflare Pages 重定向规则
-# 使用 ! 强制覆盖默认的 .html 去除行为
-/v  /v.html  200!
-/v?*  /v.html  200!
-
-# API 请求代理到 Worker
-/api/*  https://online-mirror.1334132303.workers.dev/api/:splat  200
-
