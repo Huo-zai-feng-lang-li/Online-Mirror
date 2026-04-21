@@ -991,8 +991,10 @@
 
           if (!data.isWhitelisted && data.remaining <= 0) {
             el.style.color = '#ef4444';
-            const btn = document.querySelector('.btn-primary');
-            if (btn) { btn.disabled = true; btn.title = '今日战术配额已用完'; }
+            document.querySelectorAll('.btn-primary, .btn-secondary').forEach(btn => {
+              btn.disabled = true;
+              btn.title = '今日战术配额已用完';
+            });
           }
         } catch (e) { el.textContent = '- / 10'; }
       })();

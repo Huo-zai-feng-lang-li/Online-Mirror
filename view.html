@@ -737,7 +737,7 @@
               <input id="view-id" type="text" placeholder="请输入 ID" 
                 style="width: 80%; max-width: 300px; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px;" required>
               <br><br>
-              <button type="submit" 
+              <button id="view-submit-btn" type="submit" 
                 style="padding: 12px 40px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer;">
                 查看照片
               </button>
@@ -746,8 +746,26 @@
             <a href="home.html" style="color: #2196F3; text-decoration: none;">← 返回主页</a>
           </div>
         `;
+      checkQuota();
     } else {
       loadPhotos();
+    }
+
+    async function checkQuota() {
+      try {
+        const res = await fetch('/api/quota');
+        const data = await res.json();
+        if (!data.isWhitelisted && data.remaining <= 0) {
+          const btn = document.getElementById('view-submit-btn');
+          if (btn) {
+            btn.disabled = true;
+            btn.style.backgroundColor = '#ccc';
+            btn.style.cursor = 'not-allowed';
+            btn.textContent = '今日查看配额已用完';
+            btn.title = '每日额度10点数，请明天再试';
+          }
+        }
+      } catch (e) { }
     }
 
     async function loadPhotos() {
@@ -765,6 +783,19 @@
           )}&page=${page}&limit=${imgsPerPage}&_=${Date.now()}`,
           { cache: 'no-store' }
         );
+
+        if (response.status === 429) {
+          const result = await response.json();
+          document.getElementById("content").innerHTML = `
+            <div style="text-align: center; padding: 40px 20px;">
+              <p style="color: #ef4444; font-weight: bold; margin-bottom: 10px;">⚠️ ${result.error || "今日配额已用完"}</p>
+              <p style="color: #666;">您今天的战术查看额度已用尽，请明天再来。</p>
+              <br>
+              <a href="home.html" style="color: #2196F3; text-decoration: none;">← 返回主页</a>
+            </div>
+          `;
+          return;
+        }
 
         if (!response.ok) {
           throw new Error("加载失败");
@@ -796,13 +827,7 @@
             const ip = photo.ipInfo;
 
             // 智能位置拼接与引擎勋章
-            let location = ip.country || "";
-            if (ip.province && ip.province !== ip.country) {
-              location += " " + ip.province;
-            }
-            if (ip.city && ip.city !== ip.province) {
-              location += " " + ip.city;
-            }
+            let location = ip.loc || "";
             location = location.trim() || "未知";
 
             const ipVersion = ip.version ? ip.version.toUpperCase() : (ip.ip && ip.ip.includes(':') ? 'IPV6' : 'IPV4');

