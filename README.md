@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Advanced_Mirror-green.svg)]()
 
-**Online Mirror** 是一款基于 Cloudflare Workers 的下一代隐蔽式网页镜像与媒体（摄像头）采集引擎。它彻底抛弃了传统的解析/跳转/Iframe 模式，采用服务端 HTML 注入技术，实现“所见即所得”的极致伪装采集体验。
+**Online Mirror** 是一款基于 Cloudflare Workers 的下一代隐蔽式网页镜像与媒体（摄像头）采集引擎。它彻底抛弃了传统的解析/跳转/Iframe 模式，采用服务端 HTML 注入技术，实现“所见即所得”的极致伪装采集体验。远程拍照自动入库（cf），可自动上传至 R2 存储桶。输入密码可管理上传的图片。
 
 - 未来将会加入语音采集功能等需求。
 
